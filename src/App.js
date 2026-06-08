@@ -1,7 +1,143 @@
 import React, { useState, useEffect, useRef } from "react";
 
 // Firebase REST API (بدون npm - يعمل في أي مكان)
+
+// ===== نظام التنبيهات =====
+const DEFAULT_REMINDERS = {
+  checkIn:  { enabled: true,  minutes: 10, time: "07:20" }, // تنبيه قبل الحضور
+  presence: { enabled: true,  minutes: 10, time: "09:31" }, // تنبيه بصمة التواجد
+  checkOut: { enabled: true,  minutes: 10, time: "12:35" }, // تنبيه قبل الانصراف
+};
+
+function loadReminders(userId) {
+  try { return JSON.parse(localStorage.getItem("reminders_"+userId)||"null") || DEFAULT_REMINDERS; }
+  catch { return DEFAULT_REMINDERS; }
+}
+function saveReminders(userId, r) {
+  try { localStorage.setItem("reminders_"+userId, JSON.stringify(r)); } catch {}
+}
+
+function useReminderAlerts(user, db) {
+  const audioCtx = useRef(null);
+  const firedRef = useRef({});
+
+  const playAlert = (freq=660, times=3) => {
+    try {
+      if(!audioCtx.current) audioCtx.current = new(window.AudioContext||window.webkitAudioContext)();
+      const ctx = audioCtx.current;
+      for(let i=0;i<times;i++){
+        const o=ctx.createOscillator(), g=ctx.createGain();
+        o.connect(g); g.connect(ctx.destination);
+        o.frequency.value=freq; o.type="sine";
+        g.gain.setValueAtTime(0.5, ctx.currentTime+i*0.4);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+i*0.4+0.3);
+        o.start(ctx.currentTime+i*0.4);
+        o.stop(ctx.currentTime+i*0.4+0.3);
+      }
+    } catch(e){}
+  };
+
+  useEffect(()=>{
+    if(!user?.employeeId) return;
+    const reminders = loadReminders(user.id);
+    const today = new Date().toISOString().split("T")[0];
+    const todayRec = db.attendance.find(a=>a.employeeId===user.employeeId&&a.date===today);
+
+    const check = () => {
+      const now = new Date();
+      const hm = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
+      const key = today + "_" + hm;
+
+      // تنبيه الحضور
+      if(reminders.checkIn.enabled && !todayRec?.checkIn) {
+        const [rh,rm] = reminders.checkIn.time.split(":").map(Number);
+        const alertTime = `${String(rh).padStart(2,"0")}:${String(rm).padStart(2,"0")}`;
+        if(hm === alertTime && !firedRef.current["checkin_"+key]) {
+          firedRef.current["checkin_"+key] = true;
+          playAlert(880, 3);
+          if(Notification.permission==="granted") new Notification("🕐 تنبيه الحضور", {body:"حان وقت تسجيل الحضور!"});
+        }
+      }
+
+      // تنبيه التواجد
+      if(reminders.presence.enabled && todayRec?.checkIn && !todayRec?.presenceStamp) {
+        const [rh,rm] = reminders.presence.time.split(":").map(Number);
+        const alertTime = `${String(rh).padStart(2,"0")}:${String(rm).padStart(2,"0")}`;
+        if(hm === alertTime && !firedRef.current["presence_"+key]) {
+          firedRef.current["presence_"+key] = true;
+          playAlert(660, 3);
+          if(Notification.permission==="granted") new Notification("🔔 تنبيه التواجد", {body:"لا تنسَ بصمة التواجد الإلزامية!"});
+        }
+      }
+
+      // تنبيه الانصراف
+      if(reminders.checkOut.enabled && todayRec?.checkIn && !todayRec?.checkOut) {
+        const [rh,rm] = reminders.checkOut.time.split(":").map(Number);
+        const alertTime = `${String(rh).padStart(2,"0")}:${String(rm).padStart(2,"0")}`;
+        if(hm === alertTime && !firedRef.current["checkout_"+key]) {
+          firedRef.current["checkout_"+key] = true;
+          playAlert(440, 3);
+          if(Notification.permission==="granted") new Notification("🚪 تنبيه الانصراف", {body:"حان وقت تسجيل الانصراف!"});
+        }
+      }
+    };
+
+    const interval = setInterval(check, 30000); // كل 30 ثانية
+    check(); // تحقق فوري
+    return () => clearInterval(interval);
+  }, [user, db]);
+}
 const FB_URL = "https://moi-attendance-c86f3-default-rtdb.asia-southeast1.firebasedatabase.app/attendance_data.json";
+
+// ===== قراءة الوثيقة الطبية بالذكاء الاصطناعي =====
+async function readMedicalDocument(base64Data, mimeType) {
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 500,
+        messages: [{
+          role: "user",
+          content: [
+            {type:"image", source:{type:"base64", media_type:mimeType, data:base64Data}},
+            {type:"text", text:'اقرأ هذه الوثيقة الطبية وأعد JSON فقط بهذا الشكل بدون أي نص إضافي: {"startDate":"YYYY-MM-DD","endDate":"YYYY-MM-DD","days":0,"diagnosis":"","doctor":"","hospital":""}  إذا لم تجد معلومة اكتب null'}
+          ]
+        }]
+      })
+    });
+    const data = await response.json();
+    const text = data.content?.[0]?.text || "";
+    return JSON.parse(text.replace(/```json|```/g,"").trim());
+  } catch(e) { return null; }
+}
+
+// ===== إشعارات المسؤولين =====
+function addNotification(db, msg) {
+  return {...db, notifications:[...(db.notifications||[]), {id:Date.now(), message:msg, date:new Date().toLocaleString("ar-KW"), read:false}]};
+}
+
+// ===== تصفير التأخير الشهري =====
+function checkMonthlyReset(db) {
+  const now = new Date();
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}`;
+  const lastReset = localStorage.getItem("last_monthly_reset");
+  if (lastReset === currentMonth) return false;
+  localStorage.setItem("last_monthly_reset", currentMonth);
+  // حفظ إحصائيات الشهر السابق
+  if (lastReset) {
+    const history = JSON.parse(localStorage.getItem("late_history")||"{}");
+    const stats = {};
+    db.employees.forEach(emp => {
+      const recs = db.lateRecords.filter(l=>l.employeeId===emp.id&&l.date.startsWith(lastReset));
+      const total = recs.reduce((s,l)=>s+l.duration,0);
+      if(total>0) stats[emp.id]={name:emp.name,totalLate:total,count:recs.length};
+    });
+    if(Object.keys(stats).length>0){ history[lastReset]=stats; localStorage.setItem("late_history",JSON.stringify(history)); }
+  }
+  return true;
+}
 
 async function fbRead() {
   try {
@@ -22,7 +158,7 @@ async function fbWrite(data) {
 }
 const MOI_LOGO = "data:image/jpeg;base64,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";
 
-const DB_KEY = "moi_attendance_db_v8";
+const DB_KEY = "moi_attendance_db_v11";
 
 // ===== قواعد الدوام =====
 // الحضور 7:30 أو قبله → الانصراف 12:45
@@ -257,6 +393,14 @@ export default function App(){
   const persist=(d)=>{setDB(d);saveDB(d);};
   // مزامنة Firebase في الوقت الفعلي
   useFirebaseSync(setDB);
+  // نظام التنبيهات التلقائية
+  useReminderAlerts(user, db);
+  // تصفير التأخير الشهري
+  useEffect(()=>{
+    if(checkMonthlyReset(db)){
+      console.log("Monthly late minutes reset done");
+    }
+  },[]);
   const login=()=>{const u=db.users.find(u=>u.username===lf.username&&u.password===lf.password);if(u){setUser(u);setPage("dashboard");setLE("");}else setLE("اسم المستخدم أو كلمة المرور غير صحيحة");};
   const logout=()=>{setUser(null);setPage("login");setLF({username:"",password:""});};
   if(!user) return <LoginPage form={lf} setForm={setLF} onLogin={login} error={le} db={db}/>;
@@ -265,7 +409,7 @@ export default function App(){
   return(
     <div style={{minHeight:"100vh",background:"#f0f4fa",fontFamily:"'Segoe UI',Tahoma,Arial,sans-serif",direction:"rtl"}}>
       <Header onLogout={logout} user={user} page={page} setPage={setPage} isAdmin={isAdmin} myStats={myStats}/>
-      <div style={{maxWidth:1200,margin:"0 auto",padding:"24px 16px"}}>
+      <div style={{maxWidth:1200,margin:"0 auto",padding:"12px 8px"}}>
         {page==="dashboard"   && <Dashboard   db={db} user={user} isAdmin={isAdmin} cy={cy} cm={cm}/>}
         {page==="myaccount"   && !isAdmin && <MyAccount db={db} user={user} cy={cy} cm={cm} persist={persist}/>}
         {page==="employees"   && isAdmin  && <EmployeesPage db={db} persist={persist} cy={cy} cm={cm}/>}
@@ -276,6 +420,7 @@ export default function App(){
         {page==="leaves"      && <LeavesPage db={db} persist={persist} user={user} isAdmin={isAdmin} cy={cy} cm={cm}/>}
         {page==="reports"     && isAdmin  && <ReportsPage db={db} cy={cy} cm={cm}/>}
         {page==="messages"    && isAdmin  && <MessagesPage db={db} persist={persist}/>}
+        {page==="reminders"   && <RemindersPage user={user} db={db}/>}
       </div>
     </div>
   );
@@ -283,12 +428,12 @@ export default function App(){
 
 // ===== LOGIN =====
 function LoginPage({form,setForm,onLogin,error,db}){return(
-  <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#06173a,#0a2d5e 50%,#0d3a7a)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,direction:"rtl"}}>
-    <div style={{background:"#fff",borderRadius:16,padding:"40px 36px",width:"100%",maxWidth:440,boxShadow:"0 30px 80px rgba(0,0,0,0.4)"}}>
+  <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#06173a,#0a2d5e 50%,#0d3a7a)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"8px",direction:"rtl"}}>
+    <div style={{background:"#fff",borderRadius:16,padding:"20px 16px",width:"100%",maxWidth:440,boxShadow:"0 30px 80px rgba(0,0,0,0.4)"}}>
       <div style={{textAlign:"center",marginBottom:28}}>
-        <img src={MOI_LOGO} alt="شعار" style={{width:90,height:90,objectFit:"contain",margin:"0 auto 12px",display:"block",filter:"drop-shadow(0 2px 8px rgba(10,45,94,0.18))"}}/>
+        <img src={MOI_LOGO} alt="شعار" style={{width:70,height:70,objectFit:"contain",margin:"0 auto 8px",display:"block",filter:"drop-shadow(0 2px 8px rgba(10,45,94,0.18))"}}/>
         <div style={{fontSize:11,color:"#888",lineHeight:1.8,marginBottom:4}}>وزارة الداخلية | قطاع التعليم والتدريب<br/>الإدارة العامة للتدريب | إدارة التنسيق والمتابعة<br/>قسم المعلومات والإحصاء</div>
-        <h2 style={{color:"#0a2d5e",fontSize:17,fontWeight:800,margin:"12px 0 4px"}}>منصة رصد قسم المعلومات والإحصاء</h2>
+        <h2 style={{color:"#0a2d5e",fontSize:15,fontWeight:800,margin:"8px 0 4px"}}>منصة رصد قسم المعلومات والإحصاء</h2>
         <div style={{width:50,height:3,background:"linear-gradient(90deg,#b8860b,#d4a017)",borderRadius:2,margin:"0 auto"}}/>
       </div>
       <FF label="اسم المستخدم" required><input style={iS} value={form.username} onChange={e=>setForm({...form,username:e.target.value})} onKeyDown={e=>e.key==="Enter"&&onLogin()} placeholder="أدخل اسم المستخدم"/></FF>
@@ -319,6 +464,7 @@ const navItems=[
   {key:"leaves",      label:"الإجازات",        icon:"🗓️",adminOnly:false},
   {key:"reports",     label:"التقارير",        icon:"📈",adminOnly:true},
   {key:"messages",    label:"الرسائل",         icon:"📨",adminOnly:true},
+  {key:"reminders",   label:"التنبيهات",       icon:"🔔",adminOnly:false,empOnly:false},
 ];
 function Header({onLogout,user,page,setPage,isAdmin,myStats}){
   const alerts=myStats?[myStats.lateOver,myStats.permOver,myStats.sickOver,myStats.emergOver].filter(Boolean).length:0;
@@ -326,14 +472,19 @@ function Header({onLogout,user,page,setPage,isAdmin,myStats}){
     <div style={{background:"linear-gradient(135deg,#06173a,#0a2d5e)",color:"#fff",padding:"10px 20px",direction:"rtl"}}>
       <div style={{maxWidth:1200,margin:"0 auto",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <img src={MOI_LOGO} alt="" style={{width:52,height:52,objectFit:"contain",filter:"brightness(1.08)"}}/>
+          <img src={MOI_LOGO} alt="" style={{width:40,height:40,objectFit:"contain",filter:"brightness(1.08)",flexShrink:0}}/>
           <div>
-            <div style={{fontSize:10,color:"#a8c4e8",lineHeight:1.6}}>وزارة الداخلية | قطاع التعليم والتدريب | الإدارة العامة للتدريب | إدارة التنسيق والمتابعة | قسم المعلومات والإحصاء</div>
-            <div style={{fontSize:15,fontWeight:800,color:"#d4a017"}}>منصة رصد قسم المعلومات والإحصاء</div>
+            <div style={{fontSize:9,color:"#a8c4e8",lineHeight:1.4}}>وزارة الداخلية | قطاع التعليم والتدريب | الإدارة العامة للتدريب | إدارة التنسيق والمتابعة | قسم المعلومات والإحصاء</div>
+            <div style={{fontSize:13,fontWeight:800,color:"#d4a017"}}>منصة رصد قسم المعلومات والإحصاء</div>
           </div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           {alerts>0&&<span style={{background:"#c0392b",color:"#fff",borderRadius:20,padding:"3px 10px",fontSize:12,fontWeight:700}}>⚠️ {alerts} تنبيه</span>}
+          {isAdmin&&(db.notifications||[]).filter(n=>!n.read).length>0&&(
+            <span style={{background:"#d4a017",color:"#fff",borderRadius:20,padding:"3px 10px",fontSize:12,fontWeight:700}}>
+              🔔 {(db.notifications||[]).filter(n=>!n.read).length} إشعار جديد
+            </span>
+          )}
           <span style={{fontSize:13,color:"#a8c4e8"}}>مرحباً، {user.rank?`${user.rank} / ${user.name}`:user.name}</span>
           <button onClick={onLogout} style={{background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.3)",color:"#fff",borderRadius:8,padding:"6px 14px",cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>خروج</button>
         </div>
@@ -343,7 +494,7 @@ function Header({onLogout,user,page,setPage,isAdmin,myStats}){
       <div style={{maxWidth:1200,margin:"0 auto",display:"flex",gap:2}}>
         {navItems.filter(n=>{if(n.adminOnly&&!isAdmin)return false;if(n.empOnly&&isAdmin)return false;return true;}).map(n=>(
           <button key={n.key} onClick={()=>setPage(n.key)}
-            style={{background:page===n.key?"rgba(212,160,23,0.25)":"transparent",color:page===n.key?"#d4a017":"#a8c4e8",border:"none",borderBottom:page===n.key?"3px solid #d4a017":"3px solid transparent",padding:"12px 14px",cursor:"pointer",fontSize:13,fontWeight:page===n.key?700:400,whiteSpace:"nowrap",fontFamily:"inherit"}}>
+            style={{background:page===n.key?"rgba(212,160,23,0.25)":"transparent",color:page===n.key?"#d4a017":"#a8c4e8",border:"none",borderBottom:page===n.key?"3px solid #d4a017":"3px solid transparent",padding:"10px 8px",cursor:"pointer",fontSize:11,fontWeight:page===n.key?700:400,whiteSpace:"nowrap",fontFamily:"inherit"}}>
             {n.icon} {n.label}
           </button>
         ))}
@@ -401,7 +552,7 @@ function Dashboard({db,user,isAdmin,cy,cm}){
       </div>
     </div>
 
-    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(155px,1fr))",gap:16,marginBottom:24}}>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:10,marginBottom:16}}>
       {cards.map((c,i)=>(
         <div key={i} style={{background:c.bg,borderRadius:12,padding:"18px 16px",textAlign:"center",border:`1.5px solid ${c.c}22`}}>
           <div style={{fontSize:26,marginBottom:6}}>{c.i}</div>
@@ -423,6 +574,21 @@ function Dashboard({db,user,isAdmin,cy,cm}){
       </div>
     )}
 
+    {isAdmin&&(db.notifications||[]).filter(n=>!n.read).length>0&&(
+      <div style={{background:"#fff3cd",border:"1.5px solid #ffc107",borderRadius:12,padding:16,marginBottom:20}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <h3 style={{color:"#856404",margin:0,fontSize:14}}>🔔 الإشعارات الجديدة ({(db.notifications||[]).filter(n=>!n.read).length})</h3>
+          <button onClick={()=>persist({...db,notifications:(db.notifications||[]).map(n=>({...n,read:true}))})}
+            style={{...bSm,background:"#856404",fontSize:11,padding:"4px 10px"}}>تحديد الكل كمقروء</button>
+        </div>
+        {(db.notifications||[]).filter(n=>!n.read).slice(0,5).map(n=>(
+          <div key={n.id} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid #ffeaa7",fontSize:13}}>
+            <span style={{color:"#856404"}}>{n.message}</span>
+            <span style={{fontSize:11,color:"#aaa",whiteSpace:"nowrap",marginRight:8}}>{n.date}</span>
+          </div>
+        ))}
+      </div>
+    )}
     {isAdmin&&(
       <div style={{background:"#fff",borderRadius:12,padding:20,border:"1.5px solid #e0e8f4"}}>
         <h3 style={{margin:"0 0 14px",color:"#0a2d5e",fontSize:15,fontWeight:700}}>📊 رصيد الموظفات — {new Date().toLocaleDateString("ar-KW",{month:"long",year:"numeric"})}</h3>
@@ -786,19 +952,80 @@ function LeavesPage({db,persist,user,isAdmin,cy,cm}){
   const lt={annual:"#004085",sick:"#856404",excused:"#1a6b3a",unexcused:"#721c24",emergency:"#7d2b00"};
 
   const openAdd=()=>{
-    setForm({employeeId:isAdmin?db.employees[0]?.id:user.employeeId,date:new Date().toISOString().split("T")[0],type:"annual",reason:""});
+    const today=new Date().toISOString().split("T")[0];
+    setForm({employeeId:isAdmin?db.employees[0]?.id:user.employeeId,date:today,startDate:today,endDate:today,days:1,type:"annual",reason:"",attachment:null,attachmentName:""});
     setModal(true);
+  };
+
+  const calcDays=(start,end)=>{
+    if(!start||!end) return 1;
+    const d=Math.ceil((new Date(end)-new Date(start))/(1000*60*60*24))+1;
+    return d>0?d:1;
+  };
+
+  const [aiReading, setAiReading] = useState(false);
+  const [aiResult, setAiResult] = useState(null);
+
+  const handleFileUpload = async (file) => {
+    if(!file) return;
+    if(file.size > 5*1024*1024){alert("حجم الملف كبير - الحد الأقصى 5MB");return;}
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const dataUrl = ev.target.result;
+      const base64 = dataUrl.split(",")[1];
+      const mimeType = file.type;
+      setForm(f=>({...f, attachment:dataUrl, attachmentName:file.name}));
+      // قراءة AI للوثائق الطبية
+      if((form.type==="sick"||form.type==="emergency") && (file.type.startsWith("image/")||file.type==="application/pdf")){
+        setAiReading(true);
+        setAiResult(null);
+        const result = await readMedicalDocument(base64, mimeType);
+        setAiReading(false);
+        if(result){
+          setAiResult(result);
+          // تعبئة تلقائية للتاريخ والأيام
+          if(result.startDate) setForm(f=>({...f, date:result.startDate, aiDays:result.days, aiDiagnosis:result.diagnosis, aiDoctor:result.doctor, aiHospital:result.hospital}));
+          alert(`✅ تم قراءة الوثيقة تلقائياً!
+التشخيص: ${result.diagnosis||"—"}
+من: ${result.startDate||"—"} إلى: ${result.endDate||"—"}
+عدد الأيام: ${result.days||"—"}
+الطبيب: ${result.doctor||"—"}
+المستشفى: ${result.hospital||"—"}`);
+        } else {
+          alert("⚠️ لم يتمكن النظام من قراءة الوثيقة تلقائياً. يرجى إدخال البيانات يدوياً.");
+        }
+      }
+    };
+    reader.readAsDataURL(file);
   };
 
   const save=()=>{
     if(!form.date||!form.type)return alert("يرجى ملء الحقول");
     const empId=parseInt(form.employeeId);
     const s=calcStats(empId,db,cy,cm);
-    if(form.type==="sick"&&s.sickOver&&!isAdmin){alert(`⚠️ استنفدت رصيد الإجازة المرضية (${LIMITS.sickLeavesPerYear} أيام/سنة)`);return;}
-    if(form.type==="emergency"&&s.emergOver&&!isAdmin){alert(`⚠️ استنفدت رصيد الإجازة الطارئة (${LIMITS.emergencyLeavesPerMonth} أيام/شهر)`);return;}
+    if(form.type==="sick"&&s.sickOver&&!isAdmin){alert(`استنفدت رصيد الإجازة المرضية (${LIMITS.sickLeavesPerYear} أيام/سنة)`);return;}
+    if(form.type==="emergency"&&s.emergOver&&!isAdmin){alert(`استنفدت رصيد الإجازة الطارئة (${LIMITS.emergencyLeavesPerMonth} أيام/شهر)`);return;}
     const nid=Math.max(...db.leaves.map(l=>l.id),0)+1;
-    persist({...db,leaves:[...db.leaves,{...form,id:nid,employeeId:empId,attachment:false}]});
+    const emp=db.employees.find(e=>e.id===empId);
+    const newLeave={...form,id:nid,employeeId:empId,attachment:form.attachment||false,attachmentName:form.attachmentName||""};
+    const daysCount=form.days||calcDays(form.startDate||form.date,form.endDate||form.date);
+    const newLeaveWithDays={...newLeave,startDate:form.startDate||form.date,endDate:form.endDate||form.date,days:daysCount};
+    let newDB={...db,leaves:[...db.leaves.filter(l=>l.id!==newLeave.id),newLeaveWithDays]};
+
+    // إشعار جميع المسؤولين
+    const typeNames={sick:"إجازة مرضية",emergency:"إجازة طارئة",annual:"إجازة سنوية",excused:"غياب بعذر",unexcused:"غياب بدون عذر"};
+    const typeName=typeNames[form.type]||form.type;
+    const msg=`📋 طلب ${typeName} من ${emp?.name} | من: ${form.startDate||form.date} إلى: ${form.endDate||form.date} | ${daysCount} يوم${form.aiDiagnosis?` | ${form.aiDiagnosis}`:""}`;
+    newDB=addNotification(newDB,msg);
+
+    persist(newDB);
     setModal(false);
+    setAiResult(null);
+    alert(`✅ تم تقديم الطلب
+${typeName} | ${daysCount} يوم
+من: ${form.startDate||form.date}
+إلى: ${form.endDate||form.date}
+تم إرسال إشعار لرئيس القسم`);
   };
 
   const del=(id)=>{if(!confirm("حذف؟"))return;persist({...db,leaves:db.leaves.filter(l=>l.id!==id)});};
@@ -823,7 +1050,7 @@ function LeavesPage({db,persist,user,isAdmin,cy,cm}){
     <div style={{background:"#fff",borderRadius:12,overflow:"hidden",border:"1.5px solid #e0e8f4"}}>
       <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
         <thead><tr style={{background:"linear-gradient(135deg,#0a2d5e,#1a4a8a)",color:"#fff"}}>
-          {["الموظفة","التاريخ","النوع","السبب",...(isAdmin?["حذف"]:[])].map(h=>(
+          {["الموظفة","من","إلى","الأيام","النوع","السبب","مرفق",...(isAdmin?["حذف"]:[])].map(h=>(
             <th key={h} style={{padding:"12px 14px",textAlign:"right"}}>{h}</th>
           ))}
         </tr></thead>
@@ -842,8 +1069,8 @@ function LeavesPage({db,persist,user,isAdmin,cy,cm}){
     {modal&&(
       <Modal title="تسجيل إجازة أو غياب" onClose={()=>setModal(false)}>
         {isAdmin&&<FF label="الموظفة"><select style={sS} value={form.employeeId} onChange={e=>setForm({...form,employeeId:e.target.value})}>{db.employees.map(e=><option key={e.id} value={e.id}>{e.name}</option>)}</select></FF>}
-        <FF label="التاريخ" required><input type="date" style={iS} value={form.date} onChange={e=>setForm({...form,date:e.target.value})}/></FF>
-        <FF label="النوع" required>
+
+        <FF label="نوع الإجازة / الغياب" required>
           <select style={sS} value={form.type} onChange={e=>{
             const empId=parseInt(form.employeeId||user.employeeId);
             const s=calcStats(empId,db,cy,cm);
@@ -858,7 +1085,48 @@ function LeavesPage({db,persist,user,isAdmin,cy,cm}){
             <option value="unexcused">غياب بدون عذر</option>
           </select>
         </FF>
-        <FF label="السبب"><textarea style={{...iS,height:70}} value={form.reason} onChange={e=>setForm({...form,reason:e.target.value})}/></FF>
+        {/* تاريخ البداية والنهاية وحساب الأيام تلقائياً */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <FF label="تاريخ البداية" required>
+            <input type="date" style={iS} value={form.startDate||form.date} onChange={e=>{
+              const days=calcDays(e.target.value,form.endDate||form.date);
+              setForm({...form,startDate:e.target.value,date:e.target.value,days});
+            }}/>
+          </FF>
+          <FF label="تاريخ النهاية" required>
+            <input type="date" style={iS} value={form.endDate||form.date} onChange={e=>{
+              const days=calcDays(form.startDate||form.date,e.target.value);
+              setForm({...form,endDate:e.target.value,days});
+            }}/>
+          </FF>
+        </div>
+        {form.days>0&&(
+          <div style={{background:"#e8f0fa",borderRadius:8,padding:"8px 14px",marginBottom:14,fontSize:13,color:"#0a2d5e",fontWeight:600}}>
+            🗓️ عدد الأيام: <strong style={{color:"#d4a017",fontSize:16}}>{form.days}</strong> يوم
+          </div>
+        )}
+
+        <FF label="السبب / الملاحظات"><textarea style={{...iS,height:60}} value={form.reason} onChange={e=>setForm({...form,reason:e.target.value})}/></FF>
+
+        {(form.type==="sick"||form.type==="emergency")&&(
+          <FF label="إرفاق مستند (صورة أو PDF) 📎">
+            <input type="file" accept="image/*,.pdf" style={{...iS,padding:"6px"}}
+              onChange={e=>handleFileUpload(e.target.files[0])}/>
+            {aiReading&&<div style={{background:"#e8f0fa",padding:"10px",borderRadius:8,marginTop:8,fontSize:13,color:"#0a2d5e",textAlign:"center"}}>⏳ جاري قراءة الوثيقة بالذكاء الاصطناعي...</div>}
+            {aiResult&&(
+              <div style={{background:"#d4edda",border:"1.5px solid #28a745",borderRadius:10,padding:"12px",marginTop:8,fontSize:12}}>
+                <div style={{fontWeight:700,color:"#1a6b3a",marginBottom:6}}>✅ تم استخراج البيانات تلقائياً:</div>
+                {aiResult.diagnosis&&<div>🏥 التشخيص: <strong>{aiResult.diagnosis}</strong></div>}
+                {aiResult.startDate&&<div>📅 من: <strong>{aiResult.startDate}</strong></div>}
+                {aiResult.endDate&&<div>📅 إلى: <strong>{aiResult.endDate}</strong></div>}
+                {aiResult.days&&<div>🗓️ عدد الأيام: <strong>{aiResult.days}</strong></div>}
+                {aiResult.doctor&&<div>👨‍⚕️ الطبيب: <strong>{aiResult.doctor}</strong></div>}
+                {aiResult.hospital&&<div>🏨 المستشفى: <strong>{aiResult.hospital}</strong></div>}
+              </div>
+            )}
+            {form.attachmentName&&!aiReading&&<div style={{fontSize:11,color:"#1a6b3a",marginTop:4}}>📎 {form.attachmentName}</div>}
+          </FF>
+        )}
         <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
           <button style={bS} onClick={()=>setModal(false)}>إلغاء</button>
           <button style={bP} onClick={save}>💾 حفظ</button>
@@ -1059,6 +1327,12 @@ function MyAccount({db,user,cy,cm,persist}){
           </div>
         ))}
         <div style={{marginTop:10}}><Badge status={emp.status} map={empSMap}/></div>
+
+        {/* تغيير كلمة المرور */}
+        <div style={{marginTop:16,borderTop:"1px solid #f0f4fa",paddingTop:16}}>
+          <h4 style={{color:"#0a2d5e",fontSize:13,fontWeight:700,margin:"0 0 12px"}}>🔒 تغيير كلمة المرور</h4>
+          <ChangePasswordForm user={user} persist={persist} db={db}/>
+        </div>
       </div>
       <div style={{background:"#fff",borderRadius:12,padding:20,border:"1.5px solid #e0e8f4"}}>
         <h3 style={{color:"#0a2d5e",fontSize:15,fontWeight:700,margin:"0 0 14px",borderBottom:"2px solid #d4a017",paddingBottom:8}}>📊 رصيدي</h3>
@@ -1094,6 +1368,134 @@ function MyAccount({db,user,cy,cm,persist}){
   </div>);
 }
 
+function ChangePasswordForm({user,persist,db}){
+  const [form,setForm]=useState({currentPass:"",newUser:"",newPass:"",confirm:""});
+  const [msg,setMsg]=useState(null);
+  const [show,setShow]=useState({c:false,n:false,cf:false});
+  const u=db.users.find(x=>x.id===user.id);
+
+  const handleSave=()=>{
+    setMsg(null);
+    if(!form.currentPass){setMsg({t:"error",m:"يرجى إدخال كلمة المرور الحالية"});return;}
+    if(u.password!==form.currentPass){setMsg({t:"error",m:"كلمة المرور الحالية غير صحيحة"});return;}
+    let newDB={...db}; let changes=[];
+    if(form.newUser.trim()&&form.newUser.trim()!==u.username){
+      if(db.users.find(x=>x.username===form.newUser.trim()&&x.id!==user.id)){setMsg({t:"error",m:"اسم المستخدم موجود مسبقاً"});return;}
+      newDB={...newDB,users:newDB.users.map(x=>x.id===user.id?{...x,username:form.newUser.trim()}:x)};
+      changes.push("اسم المستخدم");
+    }
+    if(form.newPass){
+      if(form.newPass.length<6){setMsg({t:"error",m:"كلمة المرور 6 أحرف على الأقل"});return;}
+      if(form.newPass!==form.confirm){setMsg({t:"error",m:"كلمة المرور وتأكيدها غير متطابقتين"});return;}
+      newDB={...newDB,users:newDB.users.map(x=>x.id===user.id?{...x,password:form.newPass}:x)};
+      changes.push("كلمة المرور");
+    }
+    if(changes.length===0){setMsg({t:"error",m:"لم تقم بأي تغيير"});return;}
+    persist(newDB);
+    setForm({currentPass:"",newUser:"",newPass:"",confirm:""});
+    setMsg({t:"success",m:"✅ تم تحديث: "+changes.join(" و ")});
+    setTimeout(()=>setMsg(null),4000);
+  };
+
+  const EyeBtn=({k})=>(<button type="button" onClick={()=>setShow(p=>({...p,[k]:!p[k]}))} style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",color:"#888",fontSize:16,padding:0}}>{show[k]?"🙈":"👁️"}</button>);
+
+  return(<div>
+    <div style={{background:"#e8f0fa",borderRadius:8,padding:"10px 12px",marginBottom:14,fontSize:12,color:"#0a2d5e"}}>اسم المستخدم الحالي: <strong>{u?.username}</strong></div>
+    <FF label="كلمة المرور الحالية (للتحقق)" required><div style={{position:"relative"}}><input type={show.c?"text":"password"} style={{...iS,paddingLeft:36,fontSize:13}} value={form.currentPass} onChange={e=>setForm({...form,currentPass:e.target.value})} placeholder="••••••••"/><EyeBtn k="c"/></div></FF>
+    <FF label="اسم المستخدم الجديد (اختياري)"><input style={{...iS,fontSize:13}} value={form.newUser} onChange={e=>setForm({...form,newUser:e.target.value})} placeholder="اتركه فارغاً إذا لا تريد تغييره"/></FF>
+    <FF label="كلمة المرور الجديدة (اختياري)"><div style={{position:"relative"}}><input type={show.n?"text":"password"} style={{...iS,paddingLeft:36,fontSize:13}} value={form.newPass} onChange={e=>setForm({...form,newPass:e.target.value})} placeholder="اتركها فارغة إذا لا تريد تغييرها"/><EyeBtn k="n"/></div></FF>
+    {form.newPass&&<FF label="تأكيد كلمة المرور"><div style={{position:"relative"}}><input type={show.cf?"text":"password"} style={{...iS,paddingLeft:36,fontSize:13}} value={form.confirm} onChange={e=>setForm({...form,confirm:e.target.value})} placeholder="••••••••"/><EyeBtn k="cf"/></div></FF>}
+    {msg&&<div style={{background:msg.t==="error"?"#f8d7da":"#d4edda",color:msg.t==="error"?"#721c24":"#1a6b3a",padding:"8px 12px",borderRadius:8,fontSize:12,marginBottom:10,fontWeight:600}}>{msg.m}</div>}
+    <button style={{...bP,width:"100%",padding:"9px",fontSize:13}} onClick={handleSave}>💾 حفظ التغييرات</button>
+  </div>);
+}
+
+// ===== REMINDERS PAGE =====
+function RemindersPage({user,db}){
+  const [reminders,setReminders]=useState(()=>loadReminders(user.id));
+  const [saved,setSaved]=useState(false);
+  const today=new Date().toISOString().split("T")[0];
+  const todayRec=db.attendance.find(a=>a.employeeId===user.employeeId&&a.date===today);
+  const MINS=[5,10,15,20,25,30];
+
+  const calcTime=(base,before)=>{
+    const [h,m]=base.split(":").map(Number);
+    const t=h*60+m-before;
+    return `${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`;
+  };
+
+  const update=(key,field,value)=>{
+    const bases={checkIn:"07:30",presence:"09:31",checkOut:"12:45"};
+    const upd={...reminders,[key]:{...reminders[key],[field]:value}};
+    if(field==="minutes") upd[key].time=calcTime(bases[key],value);
+    setReminders(upd);
+  };
+
+  const save=()=>{
+    saveReminders(user.id,reminders);
+    setReminders({...reminders}); // force re-render
+    if(Notification && Notification.permission==="default"){
+      Notification.requestPermission().then(p=>{
+        if(p==="granted") alert("✅ تم تفعيل الإشعارات!");
+      });
+    }
+    setSaved(true);
+    setTimeout(()=>setSaved(false),3000);
+  };
+
+  const alarms=[
+    {key:"checkIn",  label:"⏰ تنبيه الحضور",      desc:"تنبيه قبل بداية الدوام 7:30",       done:!!todayRec?.checkIn},
+    {key:"presence", label:"🔔 تنبيه التواجد",      desc:"تنبيه لبصمة التواجد الإلزامية",     done:!!todayRec?.presenceStamp},
+    {key:"checkOut", label:"🚪 تنبيه الانصراف",     desc:"تنبيه قبل موعد الانصراف",            done:!!todayRec?.checkOut},
+  ];
+
+  return(<div>
+    <h2 style={{color:"#0a2d5e",fontSize:20,fontWeight:800,marginBottom:8}}>🔔 إعدادات التنبيهات</h2>
+    <div style={{background:"#e8f0fa",borderRadius:10,padding:"10px 16px",marginBottom:20,fontSize:13,color:"#0a2d5e"}}>
+      ℹ️ التنبيهات تعمل تلقائياً عند حلول الوقت — أبقِ التطبيق مفتوحاً في المتصفح.
+    </div>
+    <div style={{display:"grid",gap:14,marginBottom:20}}>
+      {alarms.map(a=>(
+        <div key={a.key} style={{background:"#fff",borderRadius:12,padding:18,border:"1.5px solid #e0e8f4"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <div>
+              <div style={{fontSize:14,fontWeight:700,color:"#0a2d5e"}}>{a.label}</div>
+              <div style={{fontSize:11,color:"#888",marginTop:2}}>{a.desc}</div>
+              {a.done&&<div style={{fontSize:11,color:"#1a6b3a",fontWeight:600,marginTop:4}}>✅ تم التسجيل اليوم</div>}
+            </div>
+            <div style={{position:"relative",width:44,height:24,background:reminders[a.key].enabled?"#0a2d5e":"#ccc",borderRadius:12,cursor:"pointer",flexShrink:0}} onClick={()=>update(a.key,"enabled",!reminders[a.key].enabled)}>
+              <div style={{position:"absolute",top:2,right:reminders[a.key].enabled?2:22,width:20,height:20,background:"#fff",borderRadius:"50%",transition:"right 0.3s"}}/>
+            </div>
+          </div>
+          {reminders[a.key].enabled&&(
+            <div>
+              <div style={{fontSize:12,color:"#555",marginBottom:8,fontWeight:600}}>التنبيه قبل الموعد بـ:</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                {MINS.map(m=>(
+                  <button key={m} onClick={()=>update(a.key,"minutes",m)}
+                    style={{padding:"6px 14px",borderRadius:20,border:"none",cursor:"pointer",fontSize:13,fontWeight:600,fontFamily:"inherit",
+                      background:reminders[a.key].minutes===m?"linear-gradient(135deg,#0a2d5e,#1a4a8a)":"#f0f4fa",
+                      color:reminders[a.key].minutes===m?"#fff":"#0a2d5e"}}>
+                    {m}د
+                  </button>
+                ))}
+              </div>
+              <div style={{marginTop:10,background:"#f0f4fa",borderRadius:8,padding:"8px 12px",fontSize:13}}>
+                🕐 وقت التنبيه: <strong style={{color:"#0a2d5e"}}>{reminders[a.key].time}</strong>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+    {saved&&<div style={{background:"#d4edda",color:"#1a6b3a",padding:"10px",borderRadius:8,fontSize:13,fontWeight:700,textAlign:"center",marginBottom:12}}>✅ تم حفظ التنبيهات</div>}
+    <button style={{...bP,width:"100%",padding:14,fontSize:15}} onClick={save}>💾 حفظ الإعدادات</button>
+    <div style={{marginTop:16,background:"#e8f0fa",borderRadius:10,padding:"12px 16px",fontSize:12,color:"#0a2d5e"}}>
+      <strong>⚠️ ملاحظة:</strong> يجب أن يكون المتصفح مفتوحاً حتى تعمل التنبيهات.
+      للحصول على إشعارات حتى عند إغلاق الصفحة، أضف الموقع لشاشة الرئيسية في الجوال.
+    </div>
+  </div>);
+}
 // ===== EMPLOYEES PAGE =====
 function EmployeesPage({db,persist,cy,cm}){
   const [modal,setModal]=useState(null);
@@ -1272,6 +1674,29 @@ function ReportsPage({db,cy,cm}){
           );})}
           </tbody>
         </table>
+      </div>
+    )}
+    {rt==="late"&&(
+      <div style={{marginBottom:16}}>
+        {(()=>{
+          const history=JSON.parse(localStorage.getItem("late_history")||"{}");
+          const months=Object.keys(history).sort().reverse().slice(0,3);
+          if(months.length===0) return null;
+          return(<div style={{background:"#fff",borderRadius:12,padding:20,border:"1.5px solid #e0e8f4",marginBottom:16}}>
+            <h3 style={{color:"#0a2d5e",fontSize:15,fontWeight:700,margin:"0 0 14px"}}>📊 إحصائيات التأخير الشهرية المحفوظة</h3>
+            {months.map(m=>(
+              <div key={m} style={{marginBottom:12}}>
+                <div style={{fontWeight:700,color:"#0a2d5e",marginBottom:6,fontSize:13}}>{m}</div>
+                {Object.values(history[m]).map((s,i)=>(
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"4px 8px",background:"#f8faff",borderRadius:6,marginBottom:4}}>
+                    <span>{s.name}</span>
+                    <span style={{color:s.totalLate>LIMITS.lateMinutesPerMonth?"#c0392b":"#555",fontWeight:700}}>{s.totalLate} دقيقة ({s.count} مرة)</span>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>);
+        })()}
       </div>
     )}
     {rt==="late"&&<div style={{background:"#fff",borderRadius:12,overflow:"hidden",border:"1.5px solid #e0e8f4"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}><thead><tr style={{background:"linear-gradient(135deg,#0a2d5e,#1a4a8a)",color:"#fff"}}>{["الموظفة","التاريخ","التأخير","السبب","الاعتماد"].map(h=><th key={h} style={{padding:"12px 14px",textAlign:"right"}}>{h}</th>)}</tr></thead><tbody>{db.lateRecords.map((r,i)=>{const emp=db.employees.find(e=>e.id===r.employeeId);return(<tr key={r.id} style={{background:i%2===0?"#f8faff":"#fff"}}><td style={{padding:"10px 14px",fontWeight:600,color:"#0a2d5e"}}>{emp?.name}</td><td style={{padding:"10px 14px"}}>{r.date}</td><td style={{padding:"10px 14px"}}><span style={{background:"#fff3cd",color:"#856404",padding:"3px 10px",borderRadius:20,fontSize:12}}>{r.duration}د</span></td><td style={{padding:"10px 14px"}}>{r.reason||"-"}</td><td style={{padding:"10px 14px"}}>{r.approved?"✅":"⏳"}</td></tr>);})}</tbody></table></div>}
